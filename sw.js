@@ -1,4 +1,4 @@
-const V = 'last-time-v5';
+const V = 'last-time-v6';
 const FILES = ['./', 'index.html', 'manifest.webmanifest', 'icon-v2-180.png', 'icon-v2-192.png', 'icon-v2-512.png', 'bricolage.woff2'];
 
 self.addEventListener('install', e => {
@@ -18,7 +18,7 @@ self.addEventListener('fetch', e => {
   const req = e.request;
   if (req.method !== 'GET' || new URL(req.url).origin !== location.origin) return;
   e.respondWith(
-    fetch(req)
+    fetch(req, {cache: 'no-cache'}) // always ask the server if there's a newer copy, so updates show up right away
       .then(res => {
         if (res.ok) { const copy = res.clone(); caches.open(V).then(c => c.put(req, copy)); }
         return res;
