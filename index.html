@@ -212,6 +212,11 @@ dialog.sheet::backdrop{background:rgba(12,7,26,.6)}
   background:var(--mark);color:var(--mark-ink);box-shadow:2px 2px 0 var(--shadow);
 }
 
+.syncinfo{font-size:13px;margin:6px 0 0;color:var(--muted);line-height:1.6}
+.syncinfo .linklike{font-size:13px}
+.syncinfo.err{color:var(--danger)}
+.btn:disabled{opacity:.6}
+
 /* empty + misc */
 .empty{padding:8px 0}
 .empty p{margin:0 0 14px;color:var(--muted);max-width:44ch}
@@ -283,6 +288,7 @@ dialog.sheet::backdrop{background:rgba(12,7,26,.6)}
     <span class="status" id="status" role="status"></span>
   </div>
   <p class="backupinfo" id="backupInfo">Everything is saved on this phone only. Back up now and then.</p>
+  <p class="syncinfo" id="syncInfo"></p>
   <input type="file" id="restoreFile" accept=".json,application/json" hidden>
 </main>
 
@@ -386,7 +392,7 @@ function stats(it){
 }
 
 /* ---------- state ---------- */
-var state={items:[]};
+var state={items:[],deleted:{items:{},entries:{}}};
 var store=null, canSave=false;
 var ui={open:null,group:'All',sort:'recent',showAll:{},adding:false,intro:true};
 try{
@@ -406,21 +412,41 @@ function normalize(d){
     var log=[];
     (Array.isArray(it.log)?it.log:[]).forEach(function(e){
       if(e&&typeof e.t==='number'&&isFinite(e.t)){
-        log.push({id:typeof e.id==='string'?e.id:uid(),t:e.t,note:typeof e.note==='string'?e.note:''});
+        log.push({id:typeof e.id==='string'?e.id:uid(),t:e.t,note:typeof e.note==='string'?e.note:'',m:typeof e.m==='number'&&isFinite(e.m)?e.m:0});
       }
     });
-    out.push({id:typeof it.id==='string'?it.id:uid(),name:it.name,group:typeof it.group==='string'?it.group:'',log:log});
+    out.push({id:typeof it.id==='string'?it.id:uid(),name:it.name,group:typeof it.group==='string'?it.group:'',m:typeof it.m==='number'&&isFinite(it.m)?it.m:0,log:log});
   });
   return out;
+}
+/* deletions are remembered (id -> when) so they can carry over to other devices */
+function normalizeDeleted(d){
+  var out={items:{},entries:{}},src=d&&d.deleted&&typeof d.deleted==='object'?d.deleted:{};
+  ['items','entries'].forEach(function(k){
+    var o=src[k];
+    if(o&&typeof o==='object') Object.keys(o).forEach(function(id){
+      if(typeof o[id]==='number'&&isFinite(o[id])) out[k][id]=o[id];
+    });
+  });
+  return out;
+}
+function killEntry(it,eid){
+  it.log=it.log.filter(function(x){return x.id!==eid;});
+  state.deleted.entries[eid]=Date.now();
+}
+function reviveEntry(it,e){
+  e.m=Date.now();delete state.deleted.entries[e.id];
+  if(!it.log.some(function(x){return x.id===e.id;})) it.log.push(e);
 }
 
 /* ---------- storage ---------- */
 function readLocal(){
   var raw=null;
   try{raw=localStorage.getItem(KEY);}catch(e){}
-  if(!raw) return {ok:true,items:[]};
-  try{return {ok:true,items:normalize(JSON.parse(raw))};}
-  catch(e){return {ok:false,items:[]};}
+  var none={items:{},entries:{}};
+  if(!raw) return {ok:true,items:[],deleted:none};
+  try{var p=JSON.parse(raw);return {ok:true,items:normalize(p),deleted:normalizeDeleted(p)};}
+  catch(e){return {ok:false,items:[],deleted:none};}
 }
 async function write(body){
   localStorage.setItem(KEY,JSON.stringify(body));
@@ -441,14 +467,15 @@ async function flush(){
   var ok=true;
   while(dirty){
     dirty=false;
-    try{await write({v:1,items:state.items});ok=true;}catch(e){ok=false;}
+    try{await write({v:1,items:state.items,deleted:state.deleted});ok=true;}catch(e){ok=false;}
   }
   saving=false;setStatus(ok?'saved':'error');
 }
-function save(){
+function save(fromSync){
   if(!canSave) return;
   dirty=true;
   if(!saving) flush();
+  if(!fromSync) scheduleSync();
 }
 
 /* ---------- toast ---------- */
@@ -456,9 +483,10 @@ var toastTimer;
 function hideToast(){$('#toastwrap').classList.remove('show');}
 function toast(msg,undo,extra){
   var t=$('#toast');
-  t.replaceChildren(h('span',null,msg),
-    extra?h('button',{type:'button',onclick:function(){hideToast();extra.fn();}},extra.label):null,
-    undo?h('button',{type:'button',onclick:function(){undo();hideToast();}},'Undo'):null);
+  t.replaceChildren();
+  t.append(h('span',null,msg));
+  if(extra) t.append(h('button',{type:'button',onclick:function(){hideToast();extra.fn();}},extra.label));
+  if(undo) t.append(h('button',{type:'button',onclick:function(){undo();hideToast();}},'Undo'));
   $('#toastwrap').classList.add('show');
   clearTimeout(toastTimer);
   toastTimer=setTimeout(hideToast,extra?8000:undo?6000:2500);
@@ -477,7 +505,7 @@ function setBackedUp(t){
 }
 function renderBackupInfo(){
   var el=$('#backupInfo');if(!el) return;
-  var base='Everything is saved on this phone only.';
+  var base=getSync()?'Saved on this device and synced to your private GitHub repo.':'Everything is saved on this device only.';
   var hasLogs=state.items.some(function(i){return i.log.length;});
   var lb=getMeta().lastBackup;
   if(!canSave||!hasLogs){el.replaceChildren(base+' Back up now and then.');return;}
@@ -536,7 +564,7 @@ function logNow(id){
   celebrate(id);
   toast('Logged “'+it.name+'”',function(){
     var c=byId(id);
-    if(c){c.log=c.log.filter(function(x){return x.id!==e.id;});commit();}
+    if(c){killEntry(c,e.id);commit();}
   },{label:'Date / note',fn:function(){openEntrySheet(id,e.id,true);}});
 }
 function updateEntry(id,eid,t,note){
@@ -545,12 +573,12 @@ function updateEntry(id,eid,t,note){
   if(!e) return;
   var old={t:e.t,note:e.note};
   if(old.t===t&&old.note===note) return;
-  e.t=t;e.note=note;
+  e.t=t;e.note=note;e.m=Date.now();
   commit('row:'+id);
   toast('Saved '+fmtDate(t)+' for “'+it.name+'”',function(){
     var c=byId(id);if(!c) return;
     var x=c.log.filter(function(y){return y.id===eid;})[0];
-    if(x){x.t=old.t;x.note=old.note;commit('row:'+id);}
+    if(x){x.t=old.t;x.note=old.note;x.m=Date.now();commit('row:'+id);}
   });
 }
 function addEntry(id,t,note){
@@ -560,23 +588,23 @@ function addEntry(id,t,note){
   commit('row:'+id);
   toast('Logged '+fmtDate(t)+' for “'+it.name+'”',function(){
     var c=byId(id);
-    if(c){c.log=c.log.filter(function(x){return x.id!==e.id;});commit('row:'+id);}
+    if(c){killEntry(c,e.id);commit('row:'+id);}
   });
 }
 function removeEntry(id,eid){
   var it=byId(id);if(!it) return;
   var e=it.log.filter(function(x){return x.id===eid;})[0];
   if(!e) return;
-  it.log=it.log.filter(function(x){return x.id!==eid;});
+  killEntry(it,eid);
   commit('row:'+id);
   toast('Entry removed',function(){
     var c=byId(id);
-    if(c){c.log.push(e);commit('row:'+id);}
+    if(c){reviveEntry(c,e);commit('row:'+id);}
   });
 }
 function updateItem(id,name,group){
   var it=byId(id);if(!it) return;
-  it.name=name;it.group=group;
+  it.name=name;it.group=group;it.m=Date.now();
   commit('row:'+id);
 }
 function deleteItem(id){
@@ -584,8 +612,11 @@ function deleteItem(id){
   if(idx<0) return;
   var it=state.items.splice(idx,1)[0];
   if(ui.open===id) ui.open=null;
+  state.deleted.items[id]=Date.now();
   commit();
   toast('Deleted “'+it.name+'”',function(){
+    if(byId(id)) return;
+    it.m=Date.now();delete state.deleted.items[id];
     state.items.splice(Math.min(idx,state.items.length),0,it);
     commit();
   });
@@ -664,6 +695,7 @@ function render(o){
   renderControls();
   renderList();
   renderBackupInfo();
+  renderSyncInfo();
   if(o.focus){
     var el=document.querySelector('[data-f="'+o.focus+'"]');
     if(el) el.focus({preventScroll:true});
@@ -890,7 +922,7 @@ $('#newBtn').addEventListener('click',function(){
 /* ---------- backup / restore ---------- */
 function backupName(){return 'last-time-backup-'+isoDate(Date.now())+'.json';}
 async function exportData(){
-  var json=JSON.stringify({v:1,items:state.items},null,2);
+  var json=JSON.stringify({v:1,items:state.items,deleted:state.deleted},null,2);
   try{
     var file=new File([json],backupName(),{type:'application/json'});
     if(navigator.canShare&&navigator.canShare({files:[file]})){
@@ -917,10 +949,15 @@ function importData(file){
     if(typeof getMeta().lastBackup!=='number'&&!state.items.length&&file.lastModified) setBackedUp(Math.min(file.lastModified,Date.now()));
     var addedItems=0,addedEntries=0;
     incoming.forEach(function(inc){
-      var cur=byId(inc.id);
-      if(!cur){state.items.push(inc);addedItems++;addedEntries+=inc.log.length;return;}
+      var cur=byId(inc.id),now=Date.now();
+      function back(e){if(state.deleted.entries[e.id]!=null){delete state.deleted.entries[e.id];e.m=now;}}
+      if(!cur){
+        if(state.deleted.items[inc.id]!=null){delete state.deleted.items[inc.id];inc.m=now;}
+        inc.log.forEach(back);
+        state.items.push(inc);addedItems++;addedEntries+=inc.log.length;return;
+      }
       var have={};cur.log.forEach(function(e){have[e.id]=1;});
-      inc.log.forEach(function(e){if(!have[e.id]){cur.log.push(e);addedEntries++;}});
+      inc.log.forEach(function(e){if(!have[e.id]){back(e);cur.log.push(e);addedEntries++;}});
     });
     if(addedItems||addedEntries){commit();toast('Restored '+addedItems+' trackers, '+addedEntries+' entries');}
     else toast('Nothing new in that file');
@@ -934,6 +971,226 @@ $('#restoreFile').addEventListener('change',function(e){
   if(f) importData(f);
   e.target.value='';
 });
+
+/* ---------- sync (optional) ----------
+   The list is kept as one file in a PRIVATE GitHub repo that you own. Each device
+   merges its list with that file, so logs, edits and deletions carry across.
+   The access token lives only in this device's storage, never in the app's code. */
+var SYNCKEY='lasttime:sync', SYNCFILE='data.json';
+var API='https://api.github.com';
+function getSync(){
+  try{var c=JSON.parse(localStorage.getItem(SYNCKEY)||'null');return c&&typeof c.token==='string'&&typeof c.repo==='string'?c:null;}
+  catch(e){return null;}
+}
+function setSync(c){
+  try{if(c) localStorage.setItem(SYNCKEY,JSON.stringify(c));else localStorage.removeItem(SYNCKEY);}catch(e){}
+}
+function b64enc(str){
+  var b=new TextEncoder().encode(str),out='',i;
+  for(i=0;i<b.length;i+=0x8000) out+=String.fromCharCode.apply(null,b.subarray(i,i+0x8000));
+  return btoa(out);
+}
+function b64dec(b64){
+  var bin=atob(String(b64).replace(/\s/g,'')),b=new Uint8Array(bin.length),i;
+  for(i=0;i<bin.length;i++) b[i]=bin.charCodeAt(i);
+  return new TextDecoder().decode(b);
+}
+function canonical(d){
+  function sortKeys(o){var r={};Object.keys(o).sort().forEach(function(k){r[k]=o[k];});return r;}
+  return JSON.stringify({
+    items:d.items.slice().sort(function(a,b){return a.id<b.id?-1:a.id>b.id?1:0;}).map(function(it){
+      return {id:it.id,name:it.name,group:it.group,m:it.m||0,
+        log:it.log.slice().sort(function(a,b){return a.id<b.id?-1:a.id>b.id?1:0;}).map(function(e){return {id:e.id,t:e.t,note:e.note,m:e.m||0};})};
+    }),
+    deleted:{items:sortKeys(d.deleted.items),entries:sortKeys(d.deleted.entries)}
+  });
+}
+/* union of both sides; the most recently edited copy of anything wins; deletions win
+   unless the thing was edited or restored after it was deleted */
+function mergeData(a,b){
+  var del={items:{},entries:{}};
+  [a.deleted,b.deleted].forEach(function(d){
+    ['items','entries'].forEach(function(k){
+      Object.keys(d[k]).forEach(function(id){del[k][id]=Math.max(del[k][id]||0,d[k][id]);});
+    });
+  });
+  var map={},order=[];
+  function take(it){
+    var cur=map[it.id];
+    if(!cur){cur=map[it.id]={id:it.id,name:it.name,group:it.group,m:it.m||0,e:{},eo:[]};order.push(it.id);}
+    else if((it.m||0)>cur.m){cur.name=it.name;cur.group=it.group;cur.m=it.m||0;}
+    it.log.forEach(function(e){
+      var ce=cur.e[e.id];
+      if(!ce) cur.eo.push(e.id);
+      if(!ce||(e.m||0)>ce.m) cur.e[e.id]={id:e.id,t:e.t,note:e.note,m:e.m||0};
+    });
+  }
+  a.items.forEach(take);b.items.forEach(take);
+  var items=[];
+  order.forEach(function(id){
+    var c=map[id];
+    if(del.items[id]!=null&&del.items[id]>=c.m) return;
+    var log=[];
+    c.eo.forEach(function(eid){
+      var e=c.e[eid];
+      if(del.entries[eid]!=null&&del.entries[eid]>=e.m) return;
+      log.push(e);
+    });
+    items.push({id:c.id,name:c.name,group:c.group,m:c.m,log:log});
+  });
+  return {items:items,deleted:del};
+}
+
+var syncing=false,syncAgain=false,syncTimer=null,syncView={kind:'idle',msg:''};
+function ghFetch(cfg,path,opt){
+  opt=opt||{};
+  var headers={'Accept':'application/vnd.github+json','Authorization':'Bearer '+cfg.token,'X-GitHub-Api-Version':'2022-11-28'};
+  if(opt.body) headers['Content-Type']='application/json';
+  return fetch(API+'/repos/'+cfg.repo+path,{method:opt.method||'GET',headers:headers,body:opt.body,cache:'no-store'});
+}
+function syncProblem(status){
+  if(status===401) return 'GitHub rejected the token. It may have expired. Set up sync again with a new one.';
+  if(status===403) return 'GitHub refused. The token needs “Contents: Read and write” on the data repo.';
+  if(status===404) return 'Can’t find the data repo with this token.';
+  return 'GitHub answered with an error ('+status+'). Will try again later.';
+}
+function setSyncView(kind,msg){syncView={kind:kind,msg:msg||''};renderSyncInfo();renderBackupInfo();}
+function relTime(t){
+  var s=Math.max(0,Math.round((Date.now()-t)/1000));
+  if(s<60) return 'just now';
+  if(s<3600){var m=Math.round(s/60);return m+' min ago';}
+  if(s<86400){var hr=Math.round(s/3600);return hr+(hr===1?' hour ago':' hours ago');}
+  return fmtDate(t);
+}
+function renderSyncInfo(){
+  var el=$('#syncInfo');if(!el) return;
+  if(!canSave){el.replaceChildren();return;}
+  var cfg=getSync();
+  var open=function(){openSyncSheet();};
+  el.className='syncinfo'+(syncView.kind==='err'?' err':'');
+  if(!cfg){el.replaceChildren(h('button',{class:'linklike',type:'button',onclick:open},'Set up sync'),' to see the same list on your other devices.');return;}
+  var txt;
+  if(syncView.kind==='busy') txt='Syncing…';
+  else if(syncView.kind==='err') txt='Sync problem: '+syncView.msg;
+  else if(syncView.kind==='offline') txt='Offline. Will sync when you’re back online.';
+  else txt=cfg.last?'Synced '+relTime(cfg.last)+'.':'Sync is on.';
+  el.replaceChildren(txt+' ',h('button',{class:'linklike',type:'button',onclick:open},'Sync settings'));
+}
+function scheduleSync(ms){
+  if(!getSync()) return;
+  clearTimeout(syncTimer);
+  syncTimer=setTimeout(function(){syncNow();},ms==null?2500:ms);
+}
+async function syncNow(){
+  var cfg=getSync();
+  if(!cfg||!canSave) return false;
+  if(syncing){syncAgain=true;return false;}
+  syncing=true;clearTimeout(syncTimer);setSyncView('busy');
+  var good=false;
+  try{
+    for(var attempt=0;attempt<4&&!good;attempt++){
+      var r=await ghFetch(cfg,'/contents/'+SYNCFILE);
+      var remote={items:[],deleted:{items:{},entries:{}}},sha=null;
+      if(r.status===200){
+        var j=await r.json();sha=j.sha;
+        var txt=j.content?b64dec(j.content):'';
+        if(txt.trim()){var p=JSON.parse(txt);remote={items:normalize(p),deleted:normalizeDeleted(p)};}
+      }else if(r.status!==404){setSyncView('err',syncProblem(r.status));break;}
+      /* no awaits between reading the local list and replacing it */
+      var local={items:state.items,deleted:state.deleted};
+      var merged=mergeData(local,remote);
+      var mergedTxt=canonical(merged);
+      if(mergedTxt!==canonical(local)){
+        state.items=merged.items;state.deleted=merged.deleted;
+        if(ui.open&&!byId(ui.open)) ui.open=null;
+        save(true);
+        renderIfIdle();
+      }
+      if(mergedTxt===canonical(remote)){good=true;break;}
+      var body={message:'Sync from '+(/iPhone|iPad/.test(navigator.userAgent)?'iPhone':/Mac/.test(navigator.userAgent)?'Mac':'a device'),
+        content:b64enc(JSON.stringify({v:1,items:merged.items,deleted:merged.deleted},null,1))};
+      if(sha) body.sha=sha;
+      var w=await ghFetch(cfg,'/contents/'+SYNCFILE,{method:'PUT',body:JSON.stringify(body)});
+      if(w.status===200||w.status===201){good=true;break;}
+      if(w.status===409||w.status===422) continue; /* another device got there first: merge again */
+      setSyncView('err',syncProblem(w.status));break;
+    }
+    if(good){
+      var c2=getSync();
+      if(c2){c2.last=Date.now();setSync(c2);}
+      setSyncView('ok');
+    }else if(syncView.kind==='busy') setSyncView('err','Two devices kept saving at once. Will try again.');
+  }catch(e){
+    setSyncView(navigator.onLine===false?'offline':'err','Couldn’t reach GitHub. Will try again.');
+  }
+  syncing=false;
+  if(syncAgain){syncAgain=false;scheduleSync(600);}
+  return good;
+}
+function defaultRepo(){
+  var m=/^([a-z0-9-]+)\.github\.io$/i.exec(location.hostname);
+  return (m?m[1]:'your-username')+'/last-time-data';
+}
+function openSyncSheet(){
+  var cfg=getSync();
+  if(cfg){
+    openSheet(h('div',{class:'sheetbody'},
+      h('h2',null,'Sync is on'),
+      h('p',{class:'sub'},'This device shares its list through your private repo '+cfg.repo+'.'),
+      h('p',{class:'muted',style:'margin:0;font-size:14px'},cfg.last?'Last synced '+relTime(cfg.last)+'.':'Not synced yet.'),
+      h('div',{class:'btnrow'},
+        h('button',{class:'btn primary',type:'button',onclick:function(){closeSheet();syncNow().then(function(ok){if(ok) toast('Synced');});}},'Sync now'),
+        h('button',{class:'btn',type:'button',onclick:closeSheet},'Close')),
+      h('button',{class:'linklike',type:'button',style:'justify-self:start',onclick:function(){
+        setSync(null);setSyncView('idle');closeSheet();toast('Sync turned off on this device. Your list is still here.');
+      }},'Turn off sync on this device')));
+    return;
+  }
+  var repoIn=h('input',{type:'text',value:defaultRepo(),autocomplete:'off',autocapitalize:'none',spellcheck:'false'});
+  var tokIn=h('input',{type:'password',placeholder:'github_pat_…',autocomplete:'off',autocapitalize:'none',spellcheck:'false'});
+  var msg=h('p',{class:'status err',role:'alert',style:'margin:0;font-size:14px;min-height:20px'});
+  var go=h('button',{class:'btn primary',type:'button',onclick:connect},'Connect');
+  async function connect(){
+    var repo=repoIn.value.trim().replace(/^https:\/\/github\.com\//,'').replace(/\/+$/,''),token=tokIn.value.trim();
+    if(!/^[^\/\s]+\/[^\/\s]+$/.test(repo)){msg.textContent='The repo should look like username/last-time-data.';return;}
+    if(!token){msg.textContent='Paste the token first.';tokIn.focus();return;}
+    go.disabled=true;msg.textContent='';go.textContent='Checking…';
+    try{
+      var r=await ghFetch({repo:repo,token:token},'');
+      if(r.status!==200){msg.textContent=syncProblem(r.status);}
+      else{
+        var info=await r.json();
+        if(info.private!==true){msg.textContent='That repo is public, so anyone could read your list. Make it private first.';}
+        else{
+          setSync({repo:repo,token:token,last:0});
+          closeSheet();
+          var ok=await syncNow();
+          if(ok) toast('Sync is on');
+          return;
+        }
+      }
+    }catch(e){msg.textContent='Couldn’t reach GitHub. Check your connection and try again.';}
+    go.disabled=false;go.textContent='Connect';
+  }
+  openSheet(h('div',{class:'sheetbody'},
+    h('h2',null,'Set up sync'),
+    h('p',{class:'sub'},'Your list is kept in a private GitHub repo that only you can open. Do this once on each device.'),
+    h('label',{class:'field'},h('span',null,'Private data repo'),repoIn),
+    h('label',{class:'field'},h('span',null,'Access token (stays on this device)'),tokIn),
+    msg,
+    h('div',{class:'btnrow'},go,h('button',{class:'btn',type:'button',onclick:closeSheet},'Cancel'))));
+}
+
+/* a synced change never redraws the list under your fingers while you type */
+var stale=false;
+function renderIfIdle(){
+  var ae=document.activeElement;
+  if(sheet.open||(ae&&/^(INPUT|SELECT|TEXTAREA)$/.test(ae.tagName))){stale=true;return;}
+  stale=false;render();
+}
+function catchUp(){setTimeout(function(){if(stale) renderIfIdle();},60);}
+sheet.addEventListener('close',catchUp);
+document.addEventListener('focusout',catchUp);
 
 /* ---------- boot ---------- */
 function refresh(){
@@ -951,8 +1208,10 @@ function boot(){
     return;
   }
   state.items=res.items;
+  state.deleted=res.deleted;
   canSave=true;
   render();
+  syncNow();
   /* home-screen shortcut (where the phone supports it) opens straight into quick log */
   try{
     if(/[?&]quick=1/.test(location.search)){
@@ -962,7 +1221,9 @@ function boot(){
   }catch(e){}
   try{if(navigator.storage&&navigator.storage.persist) navigator.storage.persist();}catch(e){}
 }
-document.addEventListener('visibilitychange',function(){if(document.visibilityState==='visible') refresh();});
+document.addEventListener('visibilitychange',function(){if(document.visibilityState==='visible'){refresh();syncNow();}});
+window.addEventListener('online',function(){syncNow();});
+setInterval(function(){if(document.visibilityState==='visible') renderSyncInfo();},60000);
 window.addEventListener('pageshow',function(e){if(e.persisted) refresh();});
 if('serviceWorker' in navigator&&(location.protocol==='https:'||location.hostname==='localhost')){
   window.addEventListener('load',function(){navigator.serviceWorker.register('sw.js').catch(function(){});});
