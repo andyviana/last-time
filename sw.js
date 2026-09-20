@@ -1,4 +1,4 @@
-const V = 'last-time-v3';
+const V = 'last-time-v4';
 const FILES = ['./', 'index.html', 'manifest.webmanifest', 'icon-v2-180.png', 'icon-v2-192.png', 'icon-v2-512.png', 'bricolage.woff2'];
 
 self.addEventListener('install', e => {
